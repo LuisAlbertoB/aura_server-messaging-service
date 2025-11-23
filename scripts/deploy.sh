@@ -19,7 +19,7 @@ NC='\033[0m' # No Color
 # Configuration
 SERVICE_NAME="messaging-service"
 DB_NAME="messaging_db"
-NODE_MIN_VERSION="16"
+NODE_MIN_VERSION="18"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo -e "${BLUE}═══════════════════════════════════════${NC}"
@@ -46,144 +46,195 @@ print_warning() {
 
 # Check if running as root
 if [ "$EUID" -eq 0 ]; then 
-    print_warning "No ejecutar este script como root"
+    print_warning "No ejecutar este script como root. El script pedirá sudo cuando sea necesario."
 fi
 
-# Step 1: Check Node.js
-print_info "Verificando Node.js..."
-if ! command -v node &> /dev/null; then
-    print_error "Node.js no está instalado"
-    echo "Instala Node.js desde: https://nodejs.org/"
-    exit 1
-fi
+# ============================================
+# 1. System Dependencies & Stack Installation
+# ============================================
 
-NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
-if [ "$NODE_VERSION" -lt "$NODE_MIN_VERSION" ]; then
-    print_error "Node.js versión $NODE_MIN_VERSION o superior es requerida"
-    exit 1
-fi
-print_success "Node.js $(node -v) instalado"
+install_system_dependencies() {
+    print_info "Verificando dependencias del sistema..."
+    
+    # Update package list
+    sudo apt-get update
 
-# Step 2: Check npm
-print_info "Verificando npm..."
-if ! command -v npm &> /dev/null; then
-    print_error "npm no está instalado"
-    exit 1
-fi
-print_success "npm $(npm -v) instalado"
+    # Install basic tools
+    sudo apt-get install -y curl git build-essential openssl
+}
 
-# Step 3: Check PostgreSQL
-print_info "Verificando PostgreSQL..."
-if ! command -v psql &> /dev/null; then
-    print_error "PostgreSQL no está instalado"
-    echo "Instala PostgreSQL:"
-    echo "  sudo apt-get update"
-    echo "  sudo apt-get install postgresql postgresql-contrib"
-    exit 1
-fi
-print_success "PostgreSQL instalado"
+check_and_install_node() {
+    print_info "Verificando Node.js..."
+    if ! command -v node &> /dev/null; then
+        print_warning "Node.js no encontrado. Instalando Node.js $NODE_MIN_VERSION..."
+        curl -fsSL https://deb.nodesource.com/setup_${NODE_MIN_VERSION}.x | sudo -E bash -
+        sudo apt-get install -y nodejs
+    else
+        NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
+        if [ "$NODE_VERSION" -lt "$NODE_MIN_VERSION" ]; then
+            print_warning "Versión de Node.js antigua ($NODE_VERSION). Actualizando a $NODE_MIN_VERSION..."
+            curl -fsSL https://deb.nodesource.com/setup_${NODE_MIN_VERSION}.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+        fi
+    fi
+    print_success "Node.js $(node -v) listo"
+    print_success "npm $(npm -v) listo"
+}
 
-# Step 4: Navigate to project directory
+check_and_install_postgres() {
+    print_info "Verificando PostgreSQL..."
+    if ! command -v psql &> /dev/null; then
+        print_warning "PostgreSQL no encontrado. Instalando..."
+        sudo apt-get install -y postgresql postgresql-contrib
+        sudo systemctl start postgresql
+        sudo systemctl enable postgresql
+    fi
+    print_success "PostgreSQL instalado y corriendo"
+}
+
+# Execute installation steps
+install_system_dependencies
+check_and_install_node
+check_and_install_postgres
+
+# ============================================
+# 2. Project Setup
+# ============================================
+
+# Navigate to project directory
 print_info "Navegando al directorio del proyecto..."
 cd "$PROJECT_DIR"
 print_success "Directorio: $PROJECT_DIR"
 
-# Step 5: Check .env file
-print_info "Verificando archivo .env..."
-if [ ! -f .env ]; then
-    print_warning ".env no encontrado, creando desde .env.example..."
-    if [ -f .env.example ]; then
-        cp .env.example .env
-        print_warning "Por favor, edita .env con tus configuraciones antes de continuar"
-        echo "Presiona Enter para continuar después de editar .env..."
-        read
-    else
-        print_error ".env.example no encontrado"
-        exit 1
-    fi
-fi
-print_success "Archivo .env existe"
+# ============================================
+# 3. Environment Configuration
+# ============================================
 
-# Load environment variables
+setup_environment() {
+    print_info "Configurando variables de entorno..."
+    
+    if [ ! -f .env ]; then
+        print_warning ".env no encontrado. Generando desde .env.example..."
+        if [ -f .env.example ]; then
+            cp .env.example .env
+            
+            # Generate secure credentials
+            DB_PASS=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')
+            JWT_SEC=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9')
+            
+            # Update .env with generated credentials
+            # Use | as delimiter for sed to avoid issues with special chars in passwords
+            sed -i "s|DB_PASSWORD=.*|DB_PASSWORD=${DB_PASS}|" .env
+            sed -i "s|JWT_SECRET=.*|JWT_SECRET=${JWT_SEC}|" .env
+            
+            print_success "Archivo .env creado con credenciales seguras generadas"
+        else
+            print_error ".env.example no encontrado"
+            exit 1
+        fi
+    else
+        print_success "Archivo .env ya existe"
+    fi
+}
+
+setup_environment
+
+# Load environment variables for the script to use
 export $(cat .env | grep -v '^#' | xargs)
 
-# Step 6: Install dependencies
-print_info "Instalando dependencias..."
+# ============================================
+# 4. Database Setup
+# ============================================
+
+setup_database() {
+    print_info "Configurando base de datos..."
+    
+    # Check if user exists, create if not
+    USER_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'")
+    if [ "$USER_EXISTS" != "1" ]; then
+        print_info "Creando usuario de base de datos $DB_USER..."
+        sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASSWORD';"
+        sudo -u postgres psql -c "ALTER USER $DB_USER WITH CREATEDB;"
+        print_success "Usuario $DB_USER creado"
+    else
+        print_success "Usuario $DB_USER ya existe"
+        # Ensure password matches .env (optional, but good for consistency if env changed)
+        sudo -u postgres psql -c "ALTER USER $DB_USER WITH PASSWORD '$DB_PASSWORD';"
+    fi
+
+    # Check if DB exists, create if not
+    DB_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'")
+    if [ "$DB_EXISTS" != "1" ]; then
+        print_info "Creando base de datos $DB_NAME..."
+        sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;"
+        print_success "Base de datos $DB_NAME creada"
+    else
+        print_success "Base de datos $DB_NAME ya existe"
+    fi
+    
+    # Grant privileges
+    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;" > /dev/null
+}
+
+setup_database
+
+# ============================================
+# 5. Build & Deploy
+# ============================================
+
+# Install dependencies
+print_info "Instalando dependencias del proyecto..."
 npm install
 print_success "Dependencias instaladas"
 
-# Step 7: Create database if not exists
-print_info "Verificando base de datos PostgreSQL..."
-DB_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'")
-if [ "$DB_EXISTS" != "1" ]; then
-    print_info "Creando base de datos $DB_NAME..."
-    sudo -u postgres psql -c "CREATE DATABASE $DB_NAME;" || {
-        print_error "No se pudo crear la base de datos"
-        print_info "Intentando crear manualmente..."
-        sudo -u postgres createdb $DB_NAME
-    }
-    print_success "Base de datos $DB_NAME creada"
-else
-    print_success "Base de datos $DB_NAME ya existe"
-fi
-
-# Step 8: Run migrations
-print_info "Ejecutando migraciones de base de datos..."
+# Run migrations
+print_info "Ejecutando migraciones..."
 npm run migrate
 print_success "Migraciones completadas"
 
-# Step 9: Build TypeScript
+# Build
 print_info "Compilando TypeScript..."
 npm run build
 print_success "Compilación exitosa"
 
-# Step 10: Check if PM2 is installed (for production)
-if [ "$NODE_ENV" = "production" ]; then
-    print_info "Verificando PM2..."
+# Start with PM2
+if [ "$NODE_ENV" = "production" ] || [ "$1" == "--prod" ]; then
+    print_info "Configurando PM2 para producción..."
+    
     if ! command -v pm2 &> /dev/null; then
-        print_warning "PM2 no está instalado, instalando globalmente..."
+        print_warning "Instalando PM2 globalmente..."
         sudo npm install -g pm2
-        print_success "PM2 instalado"
-    else
-        print_success "PM2 ya está instalado"
     fi
 
-    # Step 11: Start with PM2
-    print_info "Iniciando servicio con PM2..."
     pm2 stop $SERVICE_NAME 2>/dev/null || true
     pm2 delete $SERVICE_NAME 2>/dev/null || true
+    
+    # Start app
     pm2 start dist/index.js --name $SERVICE_NAME
     pm2 save
-    print_success "Servicio iniciado con PM2"
     
-    # Show PM2 status
+    print_success "Servicio desplegado con PM2"
     pm2 status
 else
-    # Development mode
-    print_success "Despliegue completado para desarrollo"
-    print_info "Para iniciar el servidor en modo desarrollo:"
+    print_success "Setup completado para desarrollo"
+    print_info "Para iniciar el servidor:"
     echo "  npm run dev"
-    print_info "Para iniciar el servidor en modo producción:"
-    echo "  npm start"
 fi
 
-# Step 12: Final summary
+# ============================================
+# Summary
+# ============================================
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════${NC}"
 echo -e "${GREEN}✓ Despliegue completado exitosamente${NC}"
 echo -e "${BLUE}═══════════════════════════════════════${NC}"
 echo ""
-print_info "Información del servicio:"
-echo "  Puerto: ${PORT:-3003}"
-echo "  Base de datos: $DB_NAME"
-echo "  Entorno: ${NODE_ENV:-development}"
+print_info "Credenciales generadas (guardadas en .env):"
+echo "  DB User: $DB_USER"
+echo "  DB Name: $DB_NAME"
 echo ""
-print_info "Endpoints disponibles:"
-echo "  Health check: http://localhost:${PORT:-3003}/health"
-echo "  API REST: http://localhost:${PORT:-3003}/api"
-echo "  WebSocket: ws://localhost:${PORT:-3003}"
+print_info "Comandos útiles:"
+echo "  Ver logs: pm2 logs $SERVICE_NAME"
+echo "  Reiniciar: pm2 restart $SERVICE_NAME"
 echo ""
-print_info "Logs (si se usa PM2):"
-echo "  pm2 logs $SERVICE_NAME"
-echo ""
-echo -e "${BLUE}═══════════════════════════════════════${NC}"
+
